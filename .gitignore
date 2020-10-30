@@ -16,6 +16,8 @@
 /Build
 /.build
 
+/.idea
+
 # KDevelop
 /*.kdev4
 
