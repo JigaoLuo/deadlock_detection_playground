@@ -220,7 +220,7 @@ public:
   /// Delete a lock.
   void deleteLock(Lock *lock);
 
-  /// Delete a txn from wfg. TODO: delte
+  /// Delete a txn from wfg.
   void removeWFGTransaction(const Transaction &transaction) {
     std::scoped_lock l(wfg.mutex);
     wfg.removeTransaction(transaction);

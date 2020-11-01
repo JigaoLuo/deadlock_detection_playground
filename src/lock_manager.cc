@@ -86,6 +86,8 @@ bool WaitsForGraph::dfs(const Transaction* a, const Transaction* b) {
   /// Dfs from a: Check if a->b (b is the start), then cycle return false.
   marker[a] = Mark::Visited;
   auto it = graph.find(a);
+  if (it == graph.end()) return true;  /// No cycle.
+
   /// a->v1, ..., a->vn
   for (const auto& v : it->second) {
     auto [v_offset, b_offset] = checkOrder(v, b);
@@ -153,11 +155,15 @@ void WaitsForGraph::addWaitsFor(const Transaction &transaction, const Lock &lock
       waits_for.push_back(other_tx);
       auto& mark = marker[other_tx];  /// Probably insert a new node with unmarked.
       if (topo_order_generated) {
-        assert(!topo_order.empty());
         if (std::find(topo_order.begin(), topo_order.end(), other_tx) == topo_order.end()) {
           topo_order.push_back(other_tx);
         }
       }
+    }
+  }
+  if (topo_order_generated) {
+    if (std::find(topo_order.begin(), topo_order.end(), &transaction) == topo_order.end()) {
+      topo_order.push_back(&transaction);
     }
   }
 
@@ -194,20 +200,35 @@ void WaitsForGraph::addWaiters(const Transaction& owner, const std::vector<const
 
   /// Add edges.
   /// A edge: waiters -> owner.
+  auto& mark = marker[&owner];  /// Probably insert a new node with unmarked.
   for (auto* waiter : waiters) {
     auto& already_waits_for = graph[waiter];
     if (std::find(already_waits_for.begin(), already_waits_for.end(), &owner) == already_waits_for.end()) {
       already_waits_for.push_back(&owner);
+      auto& mark = marker[waiter];  /// Probably insert a new node with unmarked.
+      if (topo_order_generated) {
+        if (std::find(topo_order.begin(), topo_order.end(), waiter) == topo_order.end()) {
+          topo_order.push_back(waiter);
+        }
+      }
     }
   }
+  if (topo_order_generated) {
+    if (std::find(topo_order.begin(), topo_order.end(), &owner) == topo_order.end()) {
+      topo_order.push_back(&owner);
+    }
+  }
+
   /// The check for cycles: if the owner is waiting for transaction.
   auto outgoing = graph.find(&owner);
   if (outgoing == graph.end()) {
     return;
   }
-  auto node = *outgoing;
-  if (findDuplicate(graph, &node)) {
-    throw DeadLockError();
+
+  for (auto* waiter : waiters) {
+    if (!onlineEdgeCheck(waiter, &owner)) {
+      throw DeadLockError();
+    }
   }
 }
 
@@ -219,12 +240,14 @@ void WaitsForGraph::removeTransaction(const Transaction &transaction) {
     auto& v = list.second;
     v.erase(std::remove(v.begin(), v.end(), &transaction), v.end());
   }
+  topo_order.erase(std::remove(topo_order.begin(), topo_order.end(), &transaction), topo_order.end());
+  marker.erase(&transaction);
 }
 
 bool WaitsForGraph::generateTopologicalOrdering() {
   /// Create a vector to store in-degrees of all vertices.
-  /// Initialize all indegrees as 0.
-  std::unordered_map<const Transaction*, size_t > in_degree;
+  /// Initialize all in-degrees as 0.
+  std::unordered_map<const Transaction*, size_t> in_degree;
   in_degree.reserve(graph.size());
 
   /// Traverse adjacency lists to fill in-degrees of vertices.
@@ -342,7 +365,9 @@ std::shared_ptr<Lock> LockManager::acquireLock(Transaction &transaction, DataIte
   if (mode == LockMode::Shared ? lock->lock.try_lock_shared() : lock->lock.try_lock()) {
     lock->ownership = mode;
     lock->owners.push_back(&transaction);
-    wfg.addWaiters(transaction, lock->waiters);
+    if (!lock->waiters.empty()) {
+      wfg.addWaiters(transaction, lock->waiters);
+    }
     return lock;
   }
 
@@ -365,7 +390,9 @@ std::shared_ptr<Lock> LockManager::acquireLock(Transaction &transaction, DataIte
   lock->owners.push_back(&transaction);
 
   /// The txn get the lock, all the waits have to wait for the txn.
-  wfg.addWaiters(transaction, lock->waiters);
+  if (!lock->waiters.empty()) {
+    wfg.addWaiters(transaction, lock->waiters);
+  }
   return lock;
 }
 
