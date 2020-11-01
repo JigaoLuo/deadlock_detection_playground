@@ -8,6 +8,7 @@
 #include <chrono>
 #include <sstream>
 #include <unordered_set>
+#include <queue>
 // ---------------------------------------------------------------------------------------------------
 namespace deadlock_detection {
 // ---------------------------------------------------------------------------------------------------
@@ -66,25 +67,123 @@ static bool findDuplicate(Graph& graph, const Node* node) {
   return findDuplicate(graph, node, visited);
 }
 
+std::pair<int, int> WaitsForGraph::checkOrder(const Transaction* b, const Transaction* a) {
+  int b_offset = -1;
+  int a_offset = -1;
+  for (size_t i = 0; i < topo_order.size(); ++i) {
+    if (topo_order[i] == b) {
+      b_offset = i;
+    }
+    if (topo_order[i] == a) {
+      a_offset = i;
+    }
+  }
+  assert(b_offset != -1 && a_offset != -1);
+  return {b_offset, a_offset};
+}
+
+bool WaitsForGraph::dfs(const Transaction* a, const Transaction* b) {
+  /// Dfs from a: Check if a->b (b is the start), then cycle return false.
+  marker[a] = Mark::Visited;
+  auto it = graph.find(a);
+  /// a->v1, ..., a->vn
+  for (const auto& v : it->second) {
+    auto [v_offset, b_offset] = checkOrder(v, b);
+    if (v_offset <= b_offset) {
+      if (marker[v] == Mark::Start) {
+        return false;   /// Cycle.
+      } else if (marker[v] == Mark::Unmarked) {
+        if (!dfs(v, b)) {
+          return false;  /// Cycle.
+        }
+      }
+    }
+    return true;  /// No cycle.
+  }
+}
+
+bool WaitsForGraph::onlineEdgeCheck(const Transaction* b, const Transaction* a) {
+  auto [b_offset, a_offset] = checkOrder(b, a);
+  if (b_offset < a_offset) {
+    return true;
+  }
+
+  /// Topo ordering: a < ... < b
+  marker[b] = Mark::Start;
+  if (!dfs(a, b)) {
+    assert(a_offset <= b_offset);
+    for (size_t i = a_offset; i <= b_offset; ++i) {
+      marker[topo_order[i]] = Mark::Unmarked;
+    }
+    return false;  /// Cycle.
+  }
+
+  /// Shift: the goal to have  ... < b < a < (all nodes depending on a).
+  marker[b] = Mark::Unmarked;
+  size_t shift = 0;
+  std::vector<const Transaction*> L;
+  assert(a_offset <= b_offset);
+  for (size_t i = a_offset; i <= b_offset; ++i) {
+    if (marker[topo_order[i]] != Mark::Unmarked) {
+      L.push_back(topo_order[i]);
+      ++shift;
+      marker[topo_order[i]] = Mark::Unmarked;
+    } else {
+      assert(i - shift >= 0);
+      topo_order[i - shift] = topo_order[i];
+    }
+  }
+
+  /// TODO(future): memcpy
+  for (size_t i = 0; i < L.size(); ++i) {
+    topo_order[b_offset - L.size() + 1] = L[i];
+  }
+  return true;
+}
+
 void WaitsForGraph::addWaitsFor(const Transaction &transaction, const Lock &lock) {
   auto gurad = std::unique_lock(mutex);
 
   /// Add edges: transaction waits for all owners of the lock.
+  ///            transaction -> all owners of the lock.
   auto& waits_for = graph[&transaction];
+  auto& mark = marker[&transaction];  /// Probably insert a new node with unmarked.
   for (auto* other_tx : lock.owners) {
     if (std::find(waits_for.begin(), waits_for.end(), other_tx) == waits_for.end()) {
       waits_for.push_back(other_tx);
+      auto& mark = marker[other_tx];  /// Probably insert a new node with unmarked.
+      if (topo_order_generated) {
+        assert(!topo_order.empty());
+        if (std::find(topo_order.begin(), topo_order.end(), other_tx) == topo_order.end()) {
+          topo_order.push_back(other_tx);
+        }
+      }
     }
   }
-  /// The check for cycles: if the owner is waiting for transaction.
-  for (const auto* other_tx : lock.owners) {
-    auto it = graph.find(other_tx);
-    if (it == graph.end()) {
-      continue;
-    }
-    auto node = *it;
-    if (findDuplicate(graph, &node)) {
+
+  /// Check if necessary to generate the topo ordering.
+  if (topo_order.empty() && graph.size() > 1 && !topo_order_generated) {
+    if (!generateTopologicalOrdering()) {
       graph.erase(&transaction);
+      marker.erase(&transaction);
+      topo_order.clear();
+      throw DeadLockError();
+    }
+    topo_order_generated = true;  /// Ensure built without deadlock.
+  } else
+    if (graph.size() <= 1) {
+    return;
+  }
+
+  /// The check for cycles: if the owner is waiting for transaction.
+  /// Here assume the topo ordering exists.
+
+  /// Check each newly added edges.
+  for (auto* other_tx : lock.owners) {
+    if (!onlineEdgeCheck(&transaction, other_tx)) {
+      graph.erase(&transaction);
+      topo_order.erase(std::remove(topo_order.begin(), topo_order.end(), &transaction), topo_order.end());
+      marker.erase(&transaction);
       throw DeadLockError();
     }
   }
@@ -120,6 +219,62 @@ void WaitsForGraph::removeTransaction(const Transaction &transaction) {
     auto& v = list.second;
     v.erase(std::remove(v.begin(), v.end(), &transaction), v.end());
   }
+}
+
+bool WaitsForGraph::generateTopologicalOrdering() {
+  /// Create a vector to store in-degrees of all vertices.
+  /// Initialize all indegrees as 0.
+  std::unordered_map<const Transaction*, size_t > in_degree;
+  in_degree.reserve(graph.size());
+
+  /// Traverse adjacency lists to fill in-degrees of vertices.
+  /// This step takes O(V+E) time.
+  for (const auto& it : graph) {
+    auto& counter = in_degree[it.first];  /// Ensure all V in the ht.
+    for (const auto& in : it.second) {
+      auto& counter = in_degree[in];
+      ++counter;
+    }
+  }
+
+  /// Create an queue and enqueue all vertices with in-degree 0.
+  std::queue<const Transaction*> q;
+  for (const auto& it : in_degree) {
+    if (it.second == 0) {
+      q.push(it.first);
+    }
+  }
+
+  /// Initialize count of visited vertices.
+  int cnt = 0;
+
+  /// One by one dequeue vertices from queue and enqueue adjacents if in-degree of adjacent becomes 0.
+  while (!q.empty()) {
+    /// Extract front of queue (or perform dequeue) and add it to topological order.
+    auto& u = q.front();
+    q.pop();
+    topo_order.push_back(u);
+
+    /// Iterate through all its neighbouring nodes of dequeued node u and decrease their in-degree by 1.
+    const auto& u_edge = graph[u];
+    for (const auto& in : u_edge) {
+      /// If in-degree becomes zero, add it to queue
+      if (--in_degree[in] == 0) {
+        q.push(in);
+      }
+    }
+    cnt++;
+  }
+
+  /// Check if there was a cycle
+  if (cnt != graph.size()) {
+    return false;
+  }
+  return true;
+//  /// Print topological order
+//  for (int i = 0; i < topo_order.size(); i++)
+//    std::cout << topo_order[i] << " ";
+//  std::cout << std::endl;
 }
 
 LockManager::~LockManager() {

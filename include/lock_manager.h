@@ -131,6 +131,27 @@ private:
   std::mutex mutex;
   /// The wait graph: the values wait for the key.
   std::unordered_map<const Transaction*, std::vector<const Transaction*>> graph;
+  /// A vector to store the topological ordering of the vertices.
+  std::vector<const Transaction*> topo_order;
+  bool topo_order_generated = false;
+
+  /// The online algorithm marker.
+  enum class Mark { Unmarked = 0, Visited, Start };
+  /// The online algorithm marker.
+  std::unordered_map<const Transaction*, Mark> marker;
+  ///
+  std::pair<int, int> checkOrder(const Transaction* b, const Transaction* a);
+
+  bool dfs(const Transaction* a, const Transaction* b);
+
+  /// Use once to init the topological ordering.
+  /// Kahn’s algorithm for topological ordering. https://www.geeksforgeeks.org/topological-sorting-indegree-based-solution/
+  /// @return true for success generation. false otherwise.
+  bool generateTopologicalOrdering();
+
+  /// Add an edge: b->a: b waits for a, then check if exists b<a in topo ordering.
+  /// @return true for good graph without cycle. false for bad graph with cycle.
+  bool onlineEdgeCheck(const Transaction* b, const Transaction* a);
 
 public:
   friend LockManager;
