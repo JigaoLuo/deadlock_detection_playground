@@ -22,3 +22,7 @@ You can read more about this [here](https://en.cppreference.com/w/cpp/memory/ena
 
 - Online cycle detection algorithm implementation: https://github.com/cakebytheoceanLuo/deadlock_detection_playground/tree/734c4926e8041b2c38f55a369e7b1011c7adb545
   - Follow the idea from: https://db.in.tum.de/teaching/ss20/moderndbs/chapter4.pdf?lang=de
+  
+## Issue
+
+The lock manager maybe is not fully thread safe.
